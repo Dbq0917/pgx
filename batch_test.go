@@ -656,6 +656,82 @@ func TestConnSendBatchQueryError(t *testing.T) {
 	})
 }
 
+func TestConnSendBatchErrorAttribution(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		mustExec(t, conn, `create temporary table batch_error_attribution(id int primary key)`)
+		mustExec(t, conn, `insert into batch_error_attribution(id) values (150)`)
+
+		const queryCount = 300
+		const conflictIndex = 150
+
+		batch := &pgx.Batch{}
+		for i := range queryCount {
+			batch.Queue(`insert into batch_error_attribution(id) values ($1)`, i)
+		}
+
+		br := conn.SendBatch(ctx, batch)
+
+		var failedIndexes []int
+		for i := range queryCount {
+			_, err := br.Exec()
+
+			switch {
+			case i < conflictIndex:
+				require.NoError(t, err)
+				require.NoError(t, batch.QueuedQueries[i].Err())
+			case i == conflictIndex:
+				var pgErr *pgconn.PgError
+				require.ErrorAs(t, err, &pgErr)
+				require.Equal(t, "23505", pgErr.Code)
+				require.Same(t, err, batch.QueuedQueries[i].Err())
+				failedIndexes = append(failedIndexes, i)
+			default:
+				require.ErrorIs(t, err, pgx.ErrBatchAborted)
+				require.ErrorIs(t, batch.QueuedQueries[i].Err(), pgx.ErrBatchAborted)
+			}
+		}
+
+		require.Equal(t, []int{conflictIndex}, failedIndexes)
+
+		var pgErr *pgconn.PgError
+		require.ErrorAs(t, br.Close(), &pgErr)
+		require.Equal(t, "23505", pgErr.Code)
+
+		// The batch is still atomic: the statements before the conflict were rolled back, and the pre-existing row
+		// remains.
+		var count int
+		require.NoError(t, conn.QueryRow(ctx, `select count(*) from batch_error_attribution`).Scan(&count))
+		require.Equal(t, 1, count)
+		ensureConnValid(t, conn)
+
+		// The same attribution is available when the caller only calls Close.
+		batch = &pgx.Batch{}
+		for i := range queryCount {
+			batch.Queue(`insert into batch_error_attribution(id) values ($1)`, i)
+		}
+
+		err := conn.SendBatch(ctx, batch).Close()
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, "23505", pgErr.Code)
+		for i := range queryCount {
+			switch {
+			case i < conflictIndex:
+				require.NoError(t, batch.QueuedQueries[i].Err())
+			case i == conflictIndex:
+				require.ErrorAs(t, batch.QueuedQueries[i].Err(), &pgErr)
+				require.Equal(t, "23505", pgErr.Code)
+			default:
+				require.ErrorIs(t, batch.QueuedQueries[i].Err(), pgx.ErrBatchAborted)
+			}
+		}
+	})
+}
+
 func TestConnSendBatchQuerySyntaxError(t *testing.T) {
 	t.Parallel()
 

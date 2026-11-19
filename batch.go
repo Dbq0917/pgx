@@ -15,6 +15,7 @@ type QueuedQuery struct {
 	Arguments []any
 	Fn        batchItemFunc
 	sd        *pgconn.StatementDescription
+	err       error
 }
 
 type batchItemFunc func(br BatchResults) error
@@ -57,6 +58,15 @@ func (qq *QueuedQuery) Exec(fn func(ct pgconn.CommandTag) error) {
 
 		return fn(ct)
 	}
+}
+
+// Err returns the error attributed to qq by the most recent batch execution. It is nil if qq succeeded.
+//
+// If an earlier query in the batch failed, qq was not executed and Err returns an error where
+// errors.Is(err, ErrBatchAborted) is true. The value is set as each result is read or when BatchResults.Close
+// returns.
+func (qq *QueuedQuery) Err() error {
+	return qq.err
 }
 
 // Batch queries are a way of bundling multiple queries together to avoid
@@ -122,6 +132,11 @@ type BatchResults interface {
 	// For simple batch inserts inside a transaction or similar queries, it's sufficient to not set any callbacks,
 	// and just handle the return value of Close.
 	//
+	// If a query fails, its result reports the original error. Queries after it were not executed and report an error
+	// where errors.Is(err, ErrBatchAborted) is true. The outcome of every queued query is also available from
+	// QueuedQuery.Err after Close returns. This does not split the batch: it is still executed and rolled back
+	// atomically.
+	//
 	// Close must be called before the underlying connection can be used again. Any error that occurred during a batch
 	// operation may have made it impossible to resyncronize the connection with the server. In this case the underlying
 	// connection will have been closed.
@@ -141,7 +156,8 @@ type batchResults struct {
 	ctx       context.Context
 	conn      *Conn
 	mrr       *pgconn.MultiResultReader
-	err       error
+	err       error // fatal error that prevents reading any more results
+	queryErr  error // first error attributed to an individual query
 	b         *Batch
 	qqIdx     int
 	closed    bool
@@ -157,7 +173,20 @@ func (br *batchResults) Exec() (pgconn.CommandTag, error) {
 		return pgconn.CommandTag{}, fmt.Errorf("batch already closed")
 	}
 
-	query, arguments, _ := br.nextQueryAndArgs()
+	if br.queryErr != nil {
+		query, _, ok := br.nextQueryAndArgs()
+		if !ok {
+			return pgconn.CommandTag{}, errors.New("no more results in batch")
+		}
+		err := newErrBatchQueryAborted(br.b, br.qqIdx-1, query)
+		br.b.QueuedQueries[br.qqIdx-1].err = err
+		return pgconn.CommandTag{}, err
+	}
+
+	query, arguments, ok := br.nextQueryAndArgs()
+	if !ok {
+		return pgconn.CommandTag{}, errors.New("no more results in batch")
+	}
 
 	readStartTime := time.Now()
 
@@ -166,6 +195,7 @@ func (br *batchResults) Exec() (pgconn.CommandTag, error) {
 		if err == nil {
 			err = errors.New("no more results in batch")
 		}
+		br.recordQueryResult(br.qqIdx-1, err)
 		if br.conn.batchTracer != nil {
 			br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
 				SQL:           query,
@@ -179,7 +209,7 @@ func (br *batchResults) Exec() (pgconn.CommandTag, error) {
 
 	commandTag, err := br.mrr.ResultReader().Close()
 	if err != nil {
-		br.err = err
+		br.recordQueryResult(br.qqIdx-1, err)
 		br.mrr.Close()
 	}
 
@@ -188,21 +218,16 @@ func (br *batchResults) Exec() (pgconn.CommandTag, error) {
 			SQL:           query,
 			Args:          arguments,
 			CommandTag:    commandTag,
-			Err:           br.err,
+			Err:           err,
 			ReadStartTime: readStartTime,
 		})
 	}
 
-	return commandTag, br.err
+	return commandTag, err
 }
 
 // Query reads the results from the next query in the batch as if the query has been sent with Query.
 func (br *batchResults) Query() (Rows, error) {
-	query, arguments, ok := br.nextQueryAndArgs()
-	if !ok {
-		query = "batch query"
-	}
-
 	if br.err != nil {
 		return &baseRows{err: br.err, closed: true}, br.err
 	}
@@ -210,6 +235,22 @@ func (br *batchResults) Query() (Rows, error) {
 	if br.closed {
 		alreadyClosedErr := fmt.Errorf("batch already closed")
 		return &baseRows{err: alreadyClosedErr, closed: true}, alreadyClosedErr
+	}
+
+	if br.queryErr != nil {
+		query, _, ok := br.nextQueryAndArgs()
+		if !ok {
+			err := errors.New("no more results in batch")
+			return &baseRows{err: err, closed: true}, err
+		}
+		err := newErrBatchQueryAborted(br.b, br.qqIdx-1, query)
+		br.b.QueuedQueries[br.qqIdx-1].err = err
+		return &baseRows{err: err, closed: true}, err
+	}
+
+	query, arguments, ok := br.nextQueryAndArgs()
+	if !ok {
+		query = "batch query"
 	}
 
 	rows := br.conn.getRows(br.ctx, query, arguments)
@@ -221,6 +262,7 @@ func (br *batchResults) Query() (Rows, error) {
 			rows.err = errors.New("no more results in batch")
 		}
 		rows.closed = true
+		br.recordQueryResult(br.qqIdx-1, rows.err)
 
 		if br.conn.batchTracer != nil {
 			br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
@@ -250,12 +292,12 @@ func (br *batchResults) Close() error {
 	defer func() {
 		if !br.endTraced {
 			if br.conn != nil && br.conn.batchTracer != nil {
-				br.conn.batchTracer.TraceBatchEnd(br.ctx, br.conn, TraceBatchEndData{Err: br.err})
+				br.conn.batchTracer.TraceBatchEnd(br.ctx, br.conn, TraceBatchEndData{Err: br.finalErr()})
 			}
 			br.endTraced = true
 		}
 
-		invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
+		invalidateCachesOnBatchResultsError(br.conn, br.b, br.finalErr())
 	}()
 
 	if br.err != nil {
@@ -263,15 +305,21 @@ func (br *batchResults) Close() error {
 	}
 
 	if br.closed {
-		return nil
+		return br.finalErr()
 	}
 
 	// Read and run fn for all remaining items
-	for br.err == nil && !br.closed && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
-		if br.b.QueuedQueries[br.qqIdx].Fn != nil {
+	for br.err == nil && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
+		if br.queryErr != nil {
+			// PostgreSQL discards all requests after an error until the next Sync. Record the error for every
+			// remaining query without trying to read results that will never arrive.
+			qqIdx := br.qqIdx
+			br.qqIdx++
+			br.b.QueuedQueries[qqIdx].err = newErrBatchQueryAborted(br.b, qqIdx, br.b.QueuedQueries[qqIdx].SQL)
+		} else if br.b.QueuedQueries[br.qqIdx].Fn != nil {
 			err := br.b.QueuedQueries[br.qqIdx].Fn(br)
 			if err != nil {
-				br.err = err
+				br.recordQueryResult(br.qqIdx-1, err)
 			}
 		} else {
 			br.Exec()
@@ -281,11 +329,11 @@ func (br *batchResults) Close() error {
 	br.closed = true
 
 	err := br.mrr.Close()
-	if br.err == nil {
+	if br.err == nil && br.queryErr == nil {
 		br.err = err
 	}
 
-	return br.err
+	return br.finalErr()
 }
 
 func (br *batchResults) Tx() Tx {
@@ -294,6 +342,36 @@ func (br *batchResults) Tx() Tx {
 
 func (br *batchResults) earlyError() error {
 	return br.err
+}
+
+func (br *batchResults) finalErr() error {
+	if br.err != nil {
+		return br.err
+	}
+	return br.queryErr
+}
+
+func (br *batchResults) recordQueryResult(qqIdx int, err error) {
+	if br.b != nil {
+		if qqIdx >= 0 && qqIdx < len(br.b.QueuedQueries) {
+			br.b.QueuedQueries[qqIdx].err = err
+		}
+	}
+
+	if err == nil {
+		return
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if br.queryErr == nil {
+			br.queryErr = err
+		}
+	} else {
+		if br.err == nil {
+			br.err = err
+		}
+	}
 }
 
 func (br *batchResults) nextQueryAndArgs() (query string, args []any, ok bool) {
@@ -308,15 +386,17 @@ func (br *batchResults) nextQueryAndArgs() (query string, args []any, ok bool) {
 }
 
 type pipelineBatchResults struct {
-	ctx       context.Context
-	conn      *Conn
-	pipeline  *pgconn.Pipeline
-	lastRows  *baseRows
-	err       error
-	b         *Batch
-	qqIdx     int
-	closed    bool
-	endTraced bool
+	ctx         context.Context
+	conn        *Conn
+	pipeline    *pgconn.Pipeline
+	lastRows    *baseRows
+	lastRowsIdx int
+	err         error // fatal error that prevents reading any more results
+	queryErr    error // first error attributed to an individual query
+	b           *Batch
+	qqIdx       int
+	closed      bool
+	endTraced   bool
 }
 
 // Exec reads the results from the next query in the batch as if the query has been sent with Exec.
@@ -327,37 +407,33 @@ func (br *pipelineBatchResults) Exec() (pgconn.CommandTag, error) {
 	if br.closed {
 		return pgconn.CommandTag{}, fmt.Errorf("batch already closed")
 	}
-	if br.lastRows != nil && br.lastRows.err != nil {
-		br.err = br.lastRows.err
+
+	br.finishRows()
+	if br.err != nil {
 		return pgconn.CommandTag{}, br.err
+	}
+
+	if br.queryErr != nil {
+		query, _, err := br.nextQueryAndArgs()
+		if err != nil {
+			return pgconn.CommandTag{}, err
+		}
+		err = newErrBatchQueryAborted(br.b, br.qqIdx-1, query)
+		br.b.QueuedQueries[br.qqIdx-1].err = err
+		return pgconn.CommandTag{}, err
 	}
 
 	query, arguments, err := br.nextQueryAndArgs()
 	if err != nil {
 		return pgconn.CommandTag{}, err
 	}
+	qqIdx := br.qqIdx - 1
 
 	readStartTime := time.Now()
 
 	results, err := br.pipeline.GetResults()
 	if err != nil {
-		br.err = err
-		if br.conn.batchTracer != nil {
-			br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
-				SQL:           query,
-				Args:          arguments,
-				Err:           br.err,
-				ReadStartTime: readStartTime,
-			})
-		}
-		return pgconn.CommandTag{}, br.err
-	}
-	var commandTag pgconn.CommandTag
-	switch results := results.(type) {
-	case *pgconn.ResultReader:
-		commandTag, br.err = results.Close()
-	default:
-		err = fmt.Errorf("unexpected pipeline result: %T", results)
+		br.recordQueryResult(qqIdx, err)
 		if br.conn.batchTracer != nil {
 			br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
 				SQL:           query,
@@ -368,18 +444,26 @@ func (br *pipelineBatchResults) Exec() (pgconn.CommandTag, error) {
 		}
 		return pgconn.CommandTag{}, err
 	}
+	var commandTag pgconn.CommandTag
+	switch results := results.(type) {
+	case *pgconn.ResultReader:
+		commandTag, err = results.Close()
+	default:
+		err = fmt.Errorf("unexpected pipeline result: %T", results)
+	}
+	br.recordQueryResult(qqIdx, err)
 
 	if br.conn.batchTracer != nil {
 		br.conn.batchTracer.TraceBatchQuery(br.ctx, br.conn, TraceBatchQueryData{
 			SQL:           query,
 			Args:          arguments,
 			CommandTag:    commandTag,
-			Err:           br.err,
+			Err:           err,
 			ReadStartTime: readStartTime,
 		})
 	}
 
-	return commandTag, br.err
+	return commandTag, err
 }
 
 // Query reads the results from the next query in the batch as if the query has been sent with Query.
@@ -393,23 +477,35 @@ func (br *pipelineBatchResults) Query() (Rows, error) {
 		return &baseRows{err: alreadyClosedErr, closed: true}, alreadyClosedErr
 	}
 
-	if br.lastRows != nil && br.lastRows.err != nil {
-		br.err = br.lastRows.err
+	br.finishRows()
+	if br.err != nil {
 		return &baseRows{err: br.err, closed: true}, br.err
+	}
+
+	if br.queryErr != nil {
+		query, _, err := br.nextQueryAndArgs()
+		if err != nil {
+			return &baseRows{err: err, closed: true}, err
+		}
+		err = newErrBatchQueryAborted(br.b, br.qqIdx-1, query)
+		br.b.QueuedQueries[br.qqIdx-1].err = err
+		return &baseRows{err: err, closed: true}, err
 	}
 
 	query, arguments, err := br.nextQueryAndArgs()
 	if err != nil {
 		return &baseRows{err: err, closed: true}, err
 	}
+	qqIdx := br.qqIdx - 1
 
 	rows := br.conn.getRows(br.ctx, query, arguments)
 	rows.batchTracer = br.conn.batchTracer
 	br.lastRows = rows
+	br.lastRowsIdx = qqIdx
 
 	results, err := br.pipeline.GetResults()
 	if err != nil {
-		br.err = err
+		br.recordQueryResult(qqIdx, err)
 		rows.err = err
 		rows.closed = true
 
@@ -427,7 +523,7 @@ func (br *pipelineBatchResults) Query() (Rows, error) {
 			rows.resultReader = results
 		default:
 			err = fmt.Errorf("unexpected pipeline result: %T", results)
-			br.err = err
+			br.recordQueryResult(qqIdx, err)
 			rows.err = err
 			rows.closed = true
 
@@ -457,28 +553,32 @@ func (br *pipelineBatchResults) Close() error {
 	defer func() {
 		if !br.endTraced {
 			if br.conn.batchTracer != nil {
-				br.conn.batchTracer.TraceBatchEnd(br.ctx, br.conn, TraceBatchEndData{Err: br.err})
+				br.conn.batchTracer.TraceBatchEnd(br.ctx, br.conn, TraceBatchEndData{Err: br.finalErr()})
 			}
 			br.endTraced = true
 		}
 
-		invalidateCachesOnBatchResultsError(br.conn, br.b, br.err)
+		invalidateCachesOnBatchResultsError(br.conn, br.b, br.finalErr())
 	}()
 
-	if br.err == nil && br.lastRows != nil && br.lastRows.err != nil {
-		br.err = br.lastRows.err
+	if br.closed {
+		return br.finalErr()
 	}
 
-	if br.closed {
-		return br.err
-	}
+	br.finishRows()
 
 	// Read and run fn for all remaining items
-	for br.err == nil && !br.closed && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
-		if br.b.QueuedQueries[br.qqIdx].Fn != nil {
+	for br.err == nil && br.b != nil && br.qqIdx < len(br.b.QueuedQueries) {
+		if br.queryErr != nil {
+			// PostgreSQL discards all requests after an error until the next Sync. Record the error for every
+			// remaining query without trying to read results that will never arrive.
+			qqIdx := br.qqIdx
+			br.qqIdx++
+			br.b.QueuedQueries[qqIdx].err = newErrBatchQueryAborted(br.b, qqIdx, br.b.QueuedQueries[qqIdx].SQL)
+		} else if br.b.QueuedQueries[br.qqIdx].Fn != nil {
 			err := br.b.QueuedQueries[br.qqIdx].Fn(br)
 			if err != nil {
-				br.err = err
+				br.recordQueryResult(br.qqIdx-1, err)
 			}
 		} else {
 			br.Exec()
@@ -488,11 +588,11 @@ func (br *pipelineBatchResults) Close() error {
 	br.closed = true
 
 	err := br.pipeline.Close()
-	if br.err == nil {
+	if br.err == nil && br.queryErr == nil {
 		br.err = err
 	}
 
-	return br.err
+	return br.finalErr()
 }
 
 func (br *pipelineBatchResults) Tx() Tx {
@@ -501,6 +601,48 @@ func (br *pipelineBatchResults) Tx() Tx {
 
 func (br *pipelineBatchResults) earlyError() error {
 	return br.err
+}
+
+func (br *pipelineBatchResults) finalErr() error {
+	if br.err != nil {
+		return br.err
+	}
+	return br.queryErr
+}
+
+func (br *pipelineBatchResults) finishRows() {
+	if br.lastRows == nil {
+		return
+	}
+
+	if !br.lastRows.closed {
+		br.lastRows.Close()
+	}
+	br.recordQueryResult(br.lastRowsIdx, br.lastRows.err)
+	br.lastRows = nil
+}
+
+func (br *pipelineBatchResults) recordQueryResult(qqIdx int, err error) {
+	if br.b != nil {
+		if qqIdx >= 0 && qqIdx < len(br.b.QueuedQueries) {
+			br.b.QueuedQueries[qqIdx].err = err
+		}
+	}
+
+	if err == nil {
+		return
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if br.queryErr == nil {
+			br.queryErr = err
+		}
+	} else {
+		if br.err == nil {
+			br.err = err
+		}
+	}
 }
 
 func (br *pipelineBatchResults) nextQueryAndArgs() (query string, args []any, err error) {
@@ -615,6 +757,40 @@ func invalidateCachesOnBatchResultsError(conn *Conn, b *Batch, err error) {
 			}
 		}
 	}
+}
+
+// ErrBatchAborted is returned for a query that was not executed because an earlier query in the same batch failed.
+// PostgreSQL discards queued queries after an error until the next synchronization point, so their individual database
+// errors are not available.
+var ErrBatchAborted = errors.New("batch query was not executed because an earlier query failed")
+
+// BatchQueryAbortedError identifies a query that was not executed because an earlier query in the same batch failed.
+type BatchQueryAbortedError struct {
+	// Index is the zero-based position of the query in the batch.
+	Index int
+
+	// SQL is the query that was not executed.
+	SQL string
+}
+
+func newErrBatchQueryAborted(b *Batch, qqIdx int, sql string) error {
+	if b != nil && qqIdx >= 0 && qqIdx < len(b.QueuedQueries) {
+		sql = b.QueuedQueries[qqIdx].SQL
+	}
+
+	return &BatchQueryAbortedError{Index: qqIdx, SQL: sql}
+}
+
+func (e *BatchQueryAbortedError) Error() string {
+	return fmt.Sprintf("batch query %d was not executed because an earlier query failed", e.Index)
+}
+
+func (e *BatchQueryAbortedError) Unwrap() error {
+	return ErrBatchAborted
+}
+
+func (e *BatchQueryAbortedError) Is(target error) bool {
+	return target == ErrBatchAborted
 }
 
 // ErrPreprocessingBatch occurs when an error is encountered while preprocessing a batch.

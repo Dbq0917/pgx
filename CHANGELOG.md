@@ -1,3 +1,12 @@
+# Unreleased
+
+## Features
+
+* pgxpool: add `Router` for read/write splitting between a primary server and read-only replicas. Writes are always
+  executed on the primary. Read-only queries are distributed over the replicas in round-robin order, except during a
+  configurable sticky window after a write, when they are served by the primary to guarantee read-your-writes
+  consistency.
+
 # 5.13.0 (November 11, 2026)
 
 This release adds automatic client certificate reloading and temporal precision metadata for `database/sql`.

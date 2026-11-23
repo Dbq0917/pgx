@@ -23,5 +23,16 @@ specified here. In addition, a config struct can be created by [ParseConfig].
 
 A pool returns without waiting for any connections to be established. Acquire a connection immediately after creating
 the pool to check if a connection can successfully be established.
+
+Read/Write Splitting
+
+[Router] routes queries between a primary server and read-only replicas. Writes always go to the primary. Read-only
+queries are distributed over the replicas, except during a short sticky window after a write, when they go to the
+primary so a read never observes a stale value that has not replicated yet.
+
+    router, err := pgxpool.NewRouter(context.Background(), &pgxpool.RouterConfig{
+        Primary:  primaryConfig,
+        Replicas: []*pgxpool.Config{replicaConfig1, replicaConfig2},
+    })
 */
 package pgxpool
